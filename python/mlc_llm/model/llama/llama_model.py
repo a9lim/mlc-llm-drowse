@@ -11,6 +11,34 @@ from tvm.relax.frontend.nn import Tensor, op
 
 from mlc_llm import op as op_ext
 from mlc_llm.model.model_utils import index_last_token
+from mlc_llm.model.drowse_hooks import (
+    READOUT_TOP_K,
+    accumulate_jlens_readout,
+    accumulate_sae_jump_relu_readout,
+    accumulate_sae_readout,
+    apply_rank_one_hook,
+    apply_structured_affine_hook,
+    apply_structured_curved_hook,
+    capture_residual_positions,
+    empty_capture_buffer,
+    empty_jlens_hidden_buffer,
+    empty_structured_probe_buffer,
+    exact_readout_topk,
+    finalize_jlens_readout,
+    empty_probe_buffer,
+    measure_structured_geometry,
+    rank_one_program_spec,
+    store_capture_rows,
+    store_curve_foot,
+    store_jlens_hidden,
+    store_probe_measurement,
+    store_structured_measurements,
+    structured_affine_program_spec,
+    structured_curve_program_spec,
+    structured_geometry_program_spec,
+    structured_hook_profile_descriptor,
+    transport_jlens_hidden,
+)
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.support import logging
 from mlc_llm.support import tensor_parallel as tp
@@ -217,7 +245,7 @@ class LlamaDecoderLayer(nn.Module):
 class LlamaModel(nn.Module):
     def __init__(self, config: LlamaConfig):
         assert config.hidden_size % config.num_attention_heads == 0
-        self.embed_tokens = LlamaEmbedding("vocab_size", config.hidden_size)
+        self.embed_tokens = LlamaEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -243,13 +271,206 @@ class LlamaModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def drowse_forward(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states = input_embed
+        measurements = empty_probe_buffer(len(self.layers))
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id != 0 and layer_id in self.layer_partition:
+                hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
+            hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
+            hidden_states, measurement = apply_rank_one_hook(
+                hidden_states,
+                layer_id,
+                hook_enabled,
+                hook_basis,
+                hook_neutral,
+                hook_target,
+                hook_along,
+                hook_collapse,
+                probe_basis,
+                probe_neutral,
+            )
+            measurements = store_probe_measurement(measurements, measurement, layer_id)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, measurements
+
+    def drowse_capture_forward(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+    ):
+        hidden_states = input_embed
+        captures = empty_capture_buffer(
+            len(self.layers), capture_positions.shape[0], hidden_states.shape[2]
+        )
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id != 0 and layer_id in self.layer_partition:
+                hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
+            hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
+            layer_captures = capture_residual_positions(hidden_states, capture_positions)
+            captures = store_capture_rows(captures, layer_captures, layer_id)
+        normalized = self.norm(hidden_states)
+        return normalized, captures
+
+    def drowse_rank_one_capture_forward_v1(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states = input_embed
+        measurements = empty_probe_buffer(len(self.layers))
+        captures = empty_capture_buffer(
+            len(self.layers), capture_positions.shape[0], hidden_states.shape[2]
+        )
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id != 0 and layer_id in self.layer_partition:
+                hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
+            hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
+            hidden_states, measurement = apply_rank_one_hook(
+                hidden_states,
+                layer_id,
+                hook_enabled,
+                hook_basis,
+                hook_neutral,
+                hook_target,
+                hook_along,
+                hook_collapse,
+                probe_basis,
+                probe_neutral,
+            )
+            measurements = store_probe_measurement(measurements, measurement, layer_id)
+            layer_captures = capture_residual_positions(hidden_states, capture_positions)
+            captures = store_capture_rows(captures, layer_captures, layer_id)
+        normalized = self.norm(hidden_states)
+        return normalized, measurements, captures
+
+    def drowse_structured_forward(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+    ):
+        hidden_states = input_embed
+        measurements = empty_structured_probe_buffer(len(self.layers))
+        jlens_hidden = empty_jlens_hidden_buffer(len(self.layers), hidden_states.shape[2])
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id != 0 and layer_id in self.layer_partition:
+                hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
+            hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
+            hidden_states, layer_measurements = apply_structured_affine_hook(
+                hidden_states,
+                layer_id,
+                affine_active,
+                affine_basis,
+                affine_neutral,
+                affine_target,
+                affine_along,
+                affine_kappa,
+                probe_kind,
+                probe_direction,
+                probe_bias,
+                probe_threshold,
+            )
+            measurements = store_structured_measurements(
+                measurements, layer_measurements, layer_id
+            )
+            jlens_hidden = store_jlens_hidden(jlens_hidden, hidden_states, layer_id)
+        return self.norm(hidden_states), measurements, jlens_hidden
+
+    def drowse_curved_forward(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        decode: bool,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+        curve_basis: Tensor,
+        curve_neutral: Tensor,
+        curve_domain_kind: Tensor,
+        curve_parameters: Tensor,
+        curve_feet: Tensor,
+    ):
+        hidden_states = input_embed
+        measurements = empty_structured_probe_buffer(len(self.layers))
+        next_feet = curve_feet
+        jlens_hidden = empty_jlens_hidden_buffer(len(self.layers), hidden_states.shape[2])
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id != 0 and layer_id in self.layer_partition:
+                hidden_states = op_ext.pipeline_stage_boundary(hidden_states)
+            hidden_states = layer(hidden_states, paged_kv_cache, layer_id)
+            hidden_states, layer_measurements, foot = apply_structured_curved_hook(
+                hidden_states,
+                layer_id,
+                decode,
+                affine_active,
+                affine_basis,
+                affine_neutral,
+                affine_target,
+                affine_along,
+                affine_kappa,
+                probe_kind,
+                probe_direction,
+                probe_bias,
+                probe_threshold,
+                curve_basis,
+                curve_neutral,
+                curve_domain_kind,
+                curve_parameters,
+                curve_feet,
+            )
+            measurements = store_structured_measurements(
+                measurements, layer_measurements, layer_id
+            )
+            next_feet = store_curve_foot(next_feet, foot, layer_id)
+            jlens_hidden = store_jlens_hidden(jlens_hidden, hidden_states, layer_id)
+        return self.norm(hidden_states), measurements, next_feet, jlens_hidden
+
 
 class LlamaForCausalLM(nn.Module):
     def __init__(self, config: LlamaConfig):
         self.model = LlamaModel(config)
         self.tie_word_embeddings = config.tie_word_embeddings
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, "vocab_size", bias=False)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.num_hidden_layers = config.num_hidden_layers
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -346,6 +567,663 @@ class LlamaForCausalLM(nn.Module):
         logits = self.get_logits(hidden_states)
         return logits, paged_kv_cache
 
+    def drowse_prefill(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, measurements = self.model.drowse_forward(
+            input_embed,
+            paged_kv_cache,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        hidden_states = index_last_token(hidden_states)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements
+
+    def drowse_decode(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, measurements = self.model.drowse_forward(
+            input_embed,
+            paged_kv_cache,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements
+
+    def drowse_capture_prefill(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, captures = self.model.drowse_capture_forward(
+            input_embed,
+            paged_kv_cache,
+            capture_positions,
+        )
+        hidden_states = index_last_token(hidden_states)
+        return self.get_logits(hidden_states), paged_kv_cache, captures
+
+    def drowse_capture_decode(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, captures = self.model.drowse_capture_forward(
+            input_embed,
+            paged_kv_cache,
+            capture_positions,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, captures
+
+    def drowse_rank_one_capture_prefill_v1(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, measurements, captures = self.model.drowse_rank_one_capture_forward_v1(
+            input_embed,
+            paged_kv_cache,
+            capture_positions,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        hidden_states = index_last_token(hidden_states)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, captures
+
+    def drowse_rank_one_capture_decode_v1(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        op_ext.configure()
+        hidden_states, measurements, captures = self.model.drowse_rank_one_capture_forward_v1(
+            input_embed,
+            paged_kv_cache,
+            capture_positions,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, captures
+
+    def drowse_batch_prefill(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states, measurements = self.model.drowse_forward(
+            input_embeds,
+            paged_kv_cache,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
+        hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements
+
+    def drowse_batch_decode(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states, measurements = self.model.drowse_forward(
+            input_embeds,
+            paged_kv_cache,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements
+
+    def drowse_capture_batch_prefill(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+    ):
+        hidden_states, captures = self.model.drowse_capture_forward(
+            input_embeds,
+            paged_kv_cache,
+            capture_positions,
+        )
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
+        hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self.get_logits(hidden_states), paged_kv_cache, captures
+
+    def drowse_rank_one_capture_batch_prefill_v1(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states, measurements, captures = self.model.drowse_rank_one_capture_forward_v1(
+            input_embeds,
+            paged_kv_cache,
+            capture_positions,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
+        hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, captures
+
+    def drowse_structured_batch_prefill(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+    ):
+        hidden_states, measurements, jlens_hidden = self.model.drowse_structured_forward(
+            input_embeds,
+            paged_kv_cache,
+            affine_active,
+            affine_basis,
+            affine_neutral,
+            affine_target,
+            affine_along,
+            affine_kappa,
+            probe_kind,
+            probe_direction,
+            probe_bias,
+            probe_threshold,
+        )
+        hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, jlens_hidden
+
+    def drowse_structured_batch_decode(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+    ):
+        hidden_states, measurements, jlens_hidden = self.model.drowse_structured_forward(
+            input_embeds,
+            paged_kv_cache,
+            affine_active,
+            affine_basis,
+            affine_neutral,
+            affine_target,
+            affine_along,
+            affine_kappa,
+            probe_kind,
+            probe_direction,
+            probe_bias,
+            probe_threshold,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, jlens_hidden
+
+    def drowse_geometry_batch_prefill(
+        self,
+        hidden_states: Tensor,
+        whitener_rank: Tensor,
+        whitener_ridge: Tensor,
+        whitener_basis: Tensor,
+        whitener_correction: Tensor,
+        geometry_header: Tensor,
+        geometry_payload: Tensor,
+        geometry_feet: Tensor,
+    ):
+        return measure_structured_geometry(
+            hidden_states,
+            False,
+            whitener_rank,
+            whitener_ridge,
+            whitener_basis,
+            whitener_correction,
+            geometry_header,
+            geometry_payload,
+            geometry_feet,
+        )
+
+    def drowse_geometry_batch_decode(
+        self,
+        hidden_states: Tensor,
+        whitener_rank: Tensor,
+        whitener_ridge: Tensor,
+        whitener_basis: Tensor,
+        whitener_correction: Tensor,
+        geometry_header: Tensor,
+        geometry_payload: Tensor,
+        geometry_feet: Tensor,
+    ):
+        return measure_structured_geometry(
+            hidden_states,
+            True,
+            whitener_rank,
+            whitener_ridge,
+            whitener_basis,
+            whitener_correction,
+            geometry_header,
+            geometry_payload,
+            geometry_feet,
+        )
+
+    def drowse_curved_batch_prefill(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+        curve_basis: Tensor,
+        curve_neutral: Tensor,
+        curve_domain_kind: Tensor,
+        curve_parameters: Tensor,
+        curve_feet: Tensor,
+    ):
+        hidden_states, measurements, next_feet, jlens_hidden = self.model.drowse_curved_forward(
+            input_embeds,
+            paged_kv_cache,
+            False,
+            affine_active,
+            affine_basis,
+            affine_neutral,
+            affine_target,
+            affine_along,
+            affine_kappa,
+            probe_kind,
+            probe_direction,
+            probe_bias,
+            probe_threshold,
+            curve_basis,
+            curve_neutral,
+            curve_domain_kind,
+            curve_parameters,
+            curve_feet,
+        )
+        hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, next_feet, jlens_hidden
+
+    def drowse_curved_batch_decode(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        affine_active: Tensor,
+        affine_basis: Tensor,
+        affine_neutral: Tensor,
+        affine_target: Tensor,
+        affine_along: Tensor,
+        affine_kappa: Tensor,
+        probe_kind: Tensor,
+        probe_direction: Tensor,
+        probe_bias: Tensor,
+        probe_threshold: Tensor,
+        curve_basis: Tensor,
+        curve_neutral: Tensor,
+        curve_domain_kind: Tensor,
+        curve_parameters: Tensor,
+        curve_feet: Tensor,
+    ):
+        hidden_states, measurements, next_feet, jlens_hidden = self.model.drowse_curved_forward(
+            input_embeds,
+            paged_kv_cache,
+            True,
+            affine_active,
+            affine_basis,
+            affine_neutral,
+            affine_target,
+            affine_along,
+            affine_kappa,
+            probe_kind,
+            probe_direction,
+            probe_bias,
+            probe_threshold,
+            curve_basis,
+            curve_neutral,
+            curve_domain_kind,
+            curve_parameters,
+            curve_feet,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, next_feet, jlens_hidden
+
+    def drowse_capture_batch_decode(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+    ):
+        hidden_states, captures = self.model.drowse_capture_forward(
+            input_embeds,
+            paged_kv_cache,
+            capture_positions,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, captures
+
+    def drowse_rank_one_capture_batch_decode_v1(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        capture_positions: Tensor,
+        hook_enabled: Tensor,
+        hook_basis: Tensor,
+        hook_neutral: Tensor,
+        hook_target: Tensor,
+        hook_along: Tensor,
+        hook_collapse: Tensor,
+        probe_basis: Tensor,
+        probe_neutral: Tensor,
+    ):
+        hidden_states, measurements, captures = self.model.drowse_rank_one_capture_forward_v1(
+            input_embeds,
+            paged_kv_cache,
+            capture_positions,
+            hook_enabled,
+            hook_basis,
+            hook_neutral,
+            hook_target,
+            hook_along,
+            hook_collapse,
+            probe_basis,
+            probe_neutral,
+        )
+        return self.get_logits(hidden_states), paged_kv_cache, measurements, captures
+
+    def drowse_jlens_probabilities(
+        self,
+        hidden_states: Tensor,
+        jacobians: Tensor,
+        token_ids: Tensor,
+        layer_ids: Tensor,
+    ):
+        probabilities = self._drowse_jlens_full_probabilities(
+            hidden_states,
+            jacobians,
+            layer_ids,
+        )
+        selected = op.take(probabilities, token_ids, axis=1)
+        return op.reshape(selected, (jacobians.shape[0], token_ids.shape[0]))
+
+    def drowse_jlens_readout_accumulate(
+        self,
+        hidden_states: Tensor,
+        jacobians: Tensor,
+        token_ids: Tensor,
+        layer_ids: Tensor,
+        probability_sum: Tensor,
+        depth_sum: Tensor,
+        depth_square_sum: Tensor,
+    ):
+        probabilities = self._drowse_jlens_full_probabilities(
+            hidden_states,
+            jacobians,
+            layer_ids,
+        )
+        selected = op.reshape(
+            op.take(probabilities, token_ids, axis=1),
+            (jacobians.shape[0], token_ids.shape[0]),
+        )
+        layer_top_probabilities, layer_top_token_ids = exact_readout_topk(
+            probabilities,
+        )
+        next_sums = accumulate_jlens_readout(
+            probabilities,
+            layer_ids,
+            probability_sum,
+            depth_sum,
+            depth_square_sum,
+            self.num_hidden_layers,
+        )
+        return (
+            selected,
+            layer_top_token_ids,
+            layer_top_probabilities,
+            *next_sums,
+        )
+
+    def drowse_jlens_readout_topk(
+        self,
+        probability_sum: Tensor,
+        depth_sum: Tensor,
+        depth_square_sum: Tensor,
+        fitted_layer_count: Tensor,
+    ):
+        return finalize_jlens_readout(
+            probability_sum,
+            depth_sum,
+            depth_square_sum,
+            fitted_layer_count,
+            exact_readout_topk,
+        )
+
+    def drowse_sae_readout_accumulate(
+        self,
+        hidden_states: Tensor,
+        encoder: Tensor,
+        encoder_bias: Tensor,
+        decoder_bias: Tensor,
+        layer_id: Tensor,
+        feature_offset: Tensor,
+        prior_values: Tensor,
+        prior_feature_ids: Tensor,
+    ):
+        return accumulate_sae_readout(
+            hidden_states,
+            encoder,
+            encoder_bias,
+            decoder_bias,
+            layer_id,
+            feature_offset,
+            prior_values,
+            prior_feature_ids,
+            exact_readout_topk,
+        )
+
+    def drowse_sae_jump_relu_readout_accumulate(
+        self,
+        hidden_states: Tensor,
+        encoder: Tensor,
+        encoder_bias: Tensor,
+        encoder_threshold: Tensor,
+        decoder_bias: Tensor,
+        layer_id: Tensor,
+        feature_offset: Tensor,
+        prior_values: Tensor,
+        prior_feature_ids: Tensor,
+    ):
+        return accumulate_sae_jump_relu_readout(
+            hidden_states,
+            encoder,
+            encoder_bias,
+            encoder_threshold,
+            decoder_bias,
+            layer_id,
+            feature_offset,
+            prior_values,
+            prior_feature_ids,
+            exact_readout_topk,
+        )
+
+    def _drowse_jlens_full_probabilities(
+        self,
+        hidden_states: Tensor,
+        jacobians: Tensor,
+        layer_ids: Tensor,
+    ) -> Tensor:
+        layer_count = jacobians.shape[0]
+        hidden_states = op.take(hidden_states, layer_ids, axis=0)
+        transported = transport_jlens_hidden(hidden_states, jacobians)
+        normalized = self.model.norm(transported.astype(self.dtype))
+        logits = self.get_logits(normalized).astype("float32")
+        return op.softmax(
+            op.reshape(logits, (layer_count, self.vocab_size)), axis=-1
+        )
+
+    def drowse_jlens_directions(
+        self,
+        jacobians: Tensor,
+        token_ids: Tensor,
+    ):
+        rows = self._drowse_unembedding_rows(token_ids).astype("float32")
+        return op.matmul(
+            op.reshape(rows, (1, token_ids.shape[0], self.hidden_size)),
+            jacobians,
+        ).astype("float32")
+
+    def _drowse_unembedding_rows(self, token_ids: Tensor) -> Tensor:
+        if self.tie_word_embeddings:
+            return self.model.embed_tokens(token_ids)
+        if hasattr(self.lm_head, "weight"):
+            return op.take(self.lm_head.weight, token_ids, axis=0)
+        if (
+            hasattr(self.lm_head, "q_weight")
+            and self.lm_head.config.linear_weight_layout == "NK"
+        ):
+            q_weight = op.take(self.lm_head.q_weight, token_ids, axis=0)
+            q_scale = op.take(self.lm_head.q_scale, token_ids, axis=0)
+            return op.tensor_expr_op(
+                lambda weight, scale: self.lm_head.config._dequantize(
+                    weight,
+                    scale,
+                    axis=1,
+                    out_shape=[token_ids.shape[0], self.hidden_size],
+                ),
+                name_hint="drowse_dequantize_unembedding_rows",
+                args=[q_weight, q_scale],
+            )
+        raise ValueError("Drowse J-lens directions require row-addressable LM-head weights")
+
     def prefill_to_last_hidden_states(self, input_embed: Tensor, paged_kv_cache: PagedKVCache):
         op_ext.configure()
 
@@ -422,8 +1300,121 @@ class LlamaForCausalLM(nn.Module):
             dtype=self.dtype,
         )
 
+    def drowse_hook_profile(self):
+        return structured_hook_profile_descriptor(
+            self.num_hidden_layers,
+            self.hidden_size,
+        )
+
     def get_default_spec(self):
+        hook_spec = rank_one_program_spec(self.num_hidden_layers, self.hidden_size)
+        structured_spec = structured_affine_program_spec(
+            self.num_hidden_layers, self.hidden_size
+        )
+        curved_spec = structured_curve_program_spec(
+            self.num_hidden_layers, self.hidden_size
+        )
+        geometry_spec = structured_geometry_program_spec(
+            self.num_hidden_layers, self.hidden_size
+        )
         mod_spec = {
+            "drowse_hook_profile": {
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_jlens_probabilities": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                "jacobians": nn.spec.Tensor(
+                    ["jlens_layers", self.hidden_size, self.hidden_size],
+                    "float32",
+                ),
+                "token_ids": nn.spec.Tensor([8], "int32"),
+                "layer_ids": nn.spec.Tensor(["jlens_layers"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_jlens_readout_accumulate": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                "jacobians": nn.spec.Tensor(
+                    ["jlens_layers", self.hidden_size, self.hidden_size],
+                    "float32",
+                ),
+                "token_ids": nn.spec.Tensor([8], "int32"),
+                "layer_ids": nn.spec.Tensor(["jlens_layers"], "int32"),
+                "probability_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "depth_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "depth_square_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_jlens_readout_topk": {
+                "probability_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "depth_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "depth_square_sum": nn.spec.Tensor([self.vocab_size], "float32"),
+                "fitted_layer_count": nn.spec.Tensor([1], "int32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_sae_readout_accumulate": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                "encoder": nn.spec.Tensor(
+                    [self.hidden_size, "sae_features"], "float32"
+                ),
+                "encoder_bias": nn.spec.Tensor(["sae_features"], "float32"),
+                "decoder_bias": nn.spec.Tensor([self.hidden_size], "float32"),
+                "layer_id": nn.spec.Tensor([1], "int32"),
+                "feature_offset": nn.spec.Tensor([1], "int32"),
+                "prior_values": nn.spec.Tensor([1, 8], "float32"),
+                "prior_feature_ids": nn.spec.Tensor([1, 8], "int32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_sae_jump_relu_readout_accumulate": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                "encoder": nn.spec.Tensor(
+                    [self.hidden_size, "sae_features"], "float32"
+                ),
+                "encoder_bias": nn.spec.Tensor(["sae_features"], "float32"),
+                "encoder_threshold": nn.spec.Tensor(["sae_features"], "float32"),
+                "decoder_bias": nn.spec.Tensor([self.hidden_size], "float32"),
+                "layer_id": nn.spec.Tensor([1], "int32"),
+                "feature_offset": nn.spec.Tensor([1], "int32"),
+                "prior_values": nn.spec.Tensor([1, 8], "float32"),
+                "prior_feature_ids": nn.spec.Tensor([1, 8], "int32"),
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_jlens_directions": {
+                "jacobians": nn.spec.Tensor(
+                    ["jlens_layers", self.hidden_size, self.hidden_size],
+                    "float32",
+                ),
+                "token_ids": nn.spec.Tensor([8], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
             "embed": {
                 "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
                 "$": {
@@ -462,6 +1453,62 @@ class LlamaForCausalLM(nn.Module):
                     "effect_mode": "none",
                 },
             },
+            "drowse_prefill": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_decode": {
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_capture_prefill": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_capture_decode": {
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_rank_one_capture_prefill_v1": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_rank_one_capture_decode_v1": {
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
             "prefill_to_last_hidden_states": {
                 "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
@@ -490,6 +1537,123 @@ class LlamaForCausalLM(nn.Module):
             "batch_decode": {
                 "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_batch_decode": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_structured_batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **structured_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_structured_batch_decode": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **structured_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_geometry_batch_prefill": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                **geometry_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_geometry_batch_decode": {
+                "hidden_states": nn.spec.Tensor(
+                    [self.num_hidden_layers, self.hidden_size], "float32"
+                ),
+                **geometry_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_curved_batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **curved_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_curved_batch_decode": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                **curved_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_capture_batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_capture_batch_decode": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_rank_one_capture_batch_prefill_v1": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                **hook_spec,
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "drowse_rank_one_capture_batch_decode_v1": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "capture_positions": nn.spec.Tensor(["num_capture_positions"], "int32"),
+                **hook_spec,
                 "$": {
                     "param_mode": "packed",
                     "effect_mode": "none",
