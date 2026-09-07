@@ -3,13 +3,14 @@
 import dataclasses
 from typing import Any, Dict, Optional  # noqa: UP035
 
-from tvm import tirx
+from tvm import te, tirx
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 
 from mlc_llm import op as op_ext
 from mlc_llm.model.gemma.gemma_model import GemmaEmbedding
 from mlc_llm.model.model_utils import index_last_token
+from mlc_llm.model.qwen3.qwen3_model import Qwen3LMHeadModel, Qwen3Model
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.support import logging
 from mlc_llm.support import tensor_parallel as tp
@@ -35,13 +36,14 @@ class Gemma3TextConfig(ConfigBase):
     rms_norm_eps: float = 1e-6
     hidden_activation: Optional[str] = "gelu_pytorch_tanh"
     position_embedding_base: int = 1_000_000
+    rope_local_base_freq: int = 10_000
     rope_scaling: int = 0
     context_window_size: int = 131_072
     prefill_chunk_size: int = 0
 
     query_pre_attn_scalar: int = 256
     sliding_window_size: int = None
-    sliding_window_pattern = 6
+    sliding_window_pattern: int = 6
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)  # noqa: UP006
 
     def __post_init__(self):
@@ -88,9 +90,6 @@ class Gemma3TextConfig(ConfigBase):
                 min(self.context_window_size, 8192),
             )
             self.prefill_chunk_size = min(self.context_window_size, 8192)
-        # NOTE: override the context window size with the Gemma2 sliding window size,
-        # as the sliding window attention every other layer is yet to be supported.
-        self.context_window_size = max(self.sliding_window_size, 8192)
 
 
 @dataclasses.dataclass
@@ -195,6 +194,11 @@ class Gemma3Attention(nn.Module):
         )
         # self.scaling_factor = (self.head_dim / config.text_config.query_pre_attn_scalar) ** 0.5
         self.scaling = config.text_config.query_pre_attn_scalar**-0.5
+        self.global_rope_theta = config.text_config.position_embedding_base
+        self.local_rope_theta = config.text_config.rope_local_base_freq
+        self.sliding_window_pattern = config.text_config.sliding_window_pattern
+        rope_scaling = config.text_config.rope_scaling or {}
+        self.global_rope_scale = 1.0 / rope_scaling.get("factor", 1.0)
 
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
         d, h_q = self.head_dim, self.num_q_heads
@@ -208,6 +212,14 @@ class Gemma3Attention(nn.Module):
         k_norm = self.k_norm(k_proj)
 
         qkv = op.concat([q_norm, k_norm, v_proj], dim=2)
+        local = (layer_id + 1) % self.sliding_window_pattern != 0
+        qkv = _gemma3_rotary(
+            qkv,
+            paged_kv_cache.get_query_positions(b * s),
+            self.num_q_heads + self.num_kv_heads,
+            self.local_rope_theta if local else self.global_rope_theta,
+            1.0 if local else self.global_rope_scale,
+        )
 
         # Attention
         output = op.reshape(
@@ -217,6 +229,28 @@ class Gemma3Attention(nn.Module):
             (b, s, h_q * d),
         )
         return self.o_proj(output)
+
+
+def _gemma3_rotary(qkv: Tensor, positions: Tensor, rotary_heads: int, theta: float, scale: float):
+    def compute(x, position_map):
+        _, sequence, _, head_dim = x.shape
+
+        def rotate(batch, token, head, dim):
+            angle = (position_map[batch * sequence + token].astype("float32") * scale
+                     / tirx.power(tirx.const(theta, "float32"),
+                                  (dim % (head_dim // 2)).astype("float32") * 2 / head_dim))
+            paired = tirx.if_then_else(
+                dim < head_dim // 2,
+                -x[batch, token, head, (dim + head_dim // 2) % head_dim],
+                x[batch, token, head, (dim + head_dim // 2) % head_dim],
+            )
+            rotated = (x[batch, token, head, dim].astype("float32") * tirx.cos(angle)
+                       + paired.astype("float32") * tirx.sin(angle)).astype(x.dtype)
+            return tirx.if_then_else(head < rotary_heads, rotated, x[batch, token, head, dim])
+
+        return te.compute(x.shape, rotate, name="gemma3_rotary")
+
+    return op.tensor_expr_op(compute, "gemma3_rotary", args=[qkv, positions])
 
 
 class Gemma3DecoderLayer(nn.Module):
@@ -410,9 +444,10 @@ class Gemma3LanguageModel(nn.Module):
             num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
             qk_head_dim=self.head_dim,
             v_head_dim=self.head_dim,
-            rope_mode=RopeMode.NORMAL,
+            rope_mode=RopeMode.NONE,
             rope_scale=1,
             rope_theta=self.rope_theta,
+            rope_scaling={"drowse_local_window": self.config.text_config.sliding_window_size},
             dtype=self.dtype,
         )
 
@@ -489,6 +524,9 @@ class Gemma3ForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
         self.dtype = "float32"
         self.tensor_parallel_shards = config.tensor_parallel_shards
+        self.tie_word_embeddings = True
+        self.hidden_size = config.text_config.hidden_size
+        self.num_hidden_layers = config.text_config.num_hidden_layers
 
     def to(self, dtype: Optional[str] = None):
         super().to(dtype=dtype)
@@ -588,9 +626,10 @@ class Gemma3ForCausalLM(nn.Module):
             // self.tensor_parallel_shards,
             qk_head_dim=self.language_model.head_dim,
             v_head_dim=self.language_model.head_dim,
-            rope_mode=RopeMode.NORMAL,
+            rope_mode=RopeMode.NONE,
             rope_scale=1,
             rope_theta=self.language_model.rope_theta,
+            rope_scaling={"drowse_local_window": self.config.text_config.sliding_window_size},
             dtype=self.dtype,
         )
 
@@ -665,3 +704,70 @@ class Gemma3ForCausalLM(nn.Module):
             },
         }
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)
+
+
+def _gemma3_drowse_prepare_inputs(self, inputs: Tensor) -> Tensor:
+    return inputs * (self.hidden_size**0.5)
+
+
+def _gemma3_drowse_model(self):
+    return self.language_model.model
+
+
+Gemma3TextModel._drowse_prepare_inputs = _gemma3_drowse_prepare_inputs
+Gemma3TextModel.drowse_forward = Qwen3Model.drowse_forward
+Gemma3TextModel.drowse_capture_forward = Qwen3Model.drowse_capture_forward
+Gemma3TextModel.drowse_rank_one_capture_forward_v1 = (
+    Qwen3Model.drowse_rank_one_capture_forward_v1
+)
+Gemma3TextModel.drowse_structured_forward = Qwen3Model.drowse_structured_forward
+Gemma3TextModel.drowse_curved_forward = Qwen3Model.drowse_curved_forward
+
+Gemma3ForCausalLM.model = property(_gemma3_drowse_model)
+Gemma3ForCausalLM.drowse_prefill = Qwen3LMHeadModel.drowse_prefill
+Gemma3ForCausalLM.drowse_decode = Qwen3LMHeadModel.drowse_decode
+Gemma3ForCausalLM.drowse_capture_prefill = Qwen3LMHeadModel.drowse_capture_prefill
+Gemma3ForCausalLM.drowse_capture_decode = Qwen3LMHeadModel.drowse_capture_decode
+Gemma3ForCausalLM.drowse_rank_one_capture_prefill_v1 = (
+    Qwen3LMHeadModel.drowse_rank_one_capture_prefill_v1
+)
+Gemma3ForCausalLM.drowse_rank_one_capture_decode_v1 = (
+    Qwen3LMHeadModel.drowse_rank_one_capture_decode_v1
+)
+Gemma3ForCausalLM.drowse_batch_prefill = Qwen3LMHeadModel.drowse_batch_prefill
+Gemma3ForCausalLM.drowse_batch_decode = Qwen3LMHeadModel.drowse_batch_decode
+Gemma3ForCausalLM.drowse_capture_batch_prefill = Qwen3LMHeadModel.drowse_capture_batch_prefill
+Gemma3ForCausalLM.drowse_capture_batch_decode = Qwen3LMHeadModel.drowse_capture_batch_decode
+Gemma3ForCausalLM.drowse_rank_one_capture_batch_prefill_v1 = (
+    Qwen3LMHeadModel.drowse_rank_one_capture_batch_prefill_v1
+)
+Gemma3ForCausalLM.drowse_rank_one_capture_batch_decode_v1 = (
+    Qwen3LMHeadModel.drowse_rank_one_capture_batch_decode_v1
+)
+Gemma3ForCausalLM.drowse_structured_batch_prefill = (
+    Qwen3LMHeadModel.drowse_structured_batch_prefill
+)
+Gemma3ForCausalLM.drowse_structured_batch_decode = (
+    Qwen3LMHeadModel.drowse_structured_batch_decode
+)
+Gemma3ForCausalLM.drowse_geometry_batch_prefill = Qwen3LMHeadModel.drowse_geometry_batch_prefill
+Gemma3ForCausalLM.drowse_geometry_batch_decode = Qwen3LMHeadModel.drowse_geometry_batch_decode
+Gemma3ForCausalLM.drowse_curved_batch_prefill = Qwen3LMHeadModel.drowse_curved_batch_prefill
+Gemma3ForCausalLM.drowse_curved_batch_decode = Qwen3LMHeadModel.drowse_curved_batch_decode
+Gemma3ForCausalLM.drowse_jlens_probabilities = Qwen3LMHeadModel.drowse_jlens_probabilities
+Gemma3ForCausalLM.drowse_jlens_readout_accumulate = (
+    Qwen3LMHeadModel.drowse_jlens_readout_accumulate
+)
+Gemma3ForCausalLM.drowse_jlens_readout_topk = Qwen3LMHeadModel.drowse_jlens_readout_topk
+Gemma3ForCausalLM.drowse_sae_readout_accumulate = Qwen3LMHeadModel.drowse_sae_readout_accumulate
+Gemma3ForCausalLM.drowse_sae_jump_relu_readout_accumulate = (
+    Qwen3LMHeadModel.drowse_sae_jump_relu_readout_accumulate
+)
+Gemma3ForCausalLM._drowse_jlens_full_probabilities = (
+    Qwen3LMHeadModel._drowse_jlens_full_probabilities
+)
+Gemma3ForCausalLM.drowse_jlens_directions = Qwen3LMHeadModel.drowse_jlens_directions
+Gemma3ForCausalLM._drowse_unembedding_rows = Qwen3LMHeadModel._drowse_unembedding_rows
+Gemma3ForCausalLM._get_logits = Qwen3LMHeadModel._get_logits
+Gemma3ForCausalLM.drowse_hook_profile = Qwen3LMHeadModel.drowse_hook_profile
+Gemma3ForCausalLM.get_default_spec = Qwen3LMHeadModel.get_default_spec

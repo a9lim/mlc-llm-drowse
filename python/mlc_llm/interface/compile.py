@@ -107,17 +107,24 @@ def _infer_kv_state_kind(model_type) -> str:
 
 def _compile(args: CompileArgs, model_config: ConfigBase):
     def _get_variable_bounds(model_config) -> Dict[str, int]:  # noqa: UP006
+        num_hidden_layers = getattr(model_config, "num_hidden_layers", None)
+        if num_hidden_layers is None:
+            num_hidden_layers = model_config.text_config.num_hidden_layers
         if hasattr(model_config, "sliding_window_size"):
             return {
                 "rolling_cache_len": model_config.sliding_window_size,
                 "kv_seq_len": model_config.sliding_window_size + model_config.prefill_chunk_size,
                 "seq_len": model_config.prefill_chunk_size,
                 "batch_size": getattr(model_config, "max_batch_size", 1),
+                "jlens_layers": num_hidden_layers,
+                "sae_features": 16384,
             }
         return {
             "total_seq_len": model_config.context_window_size,
             "seq_len": model_config.prefill_chunk_size,
             "batch_size": getattr(model_config, "max_batch_size", 1),
+            "jlens_layers": num_hidden_layers,
+            "sae_features": 16384,
         }
 
     def _get_param_metadata(name: str, param: nn.Parameter) -> Dict[str, Any]:  # noqa: UP006

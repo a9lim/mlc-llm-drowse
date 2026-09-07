@@ -10,7 +10,6 @@ from tvm.script import tirx as T
 
 # mypy: disable-error-code="attr-defined,name-defined"
 
-
 def moe_sum(x: Tensor, dim: int) -> Tensor:
     """Compute the sum of the input tensor along the given axis. It is specialized for the MoE
     case where `x.ndim == 3` and `x.shape[1] == num_experts_per_tok (which is 2)`.
@@ -36,7 +35,7 @@ def _gating_topk_init_local_top_k(k_val, dtype, local_top_k, local_top_k_index):
     for t in range(k_val):
         T.buffer_store(local_top_k, T.min_value(dtype), indices=[t])
     for t in range(k_val):
-        T.buffer_store(local_top_k_index, t, indices=[-1])
+        T.buffer_store(local_top_k_index, -1, indices=[t])
 
 
 def _gating_topk_process_value(k_val, x, local_top_k, local_top_k_index, vi, vk):
